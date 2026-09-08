@@ -25,4 +25,22 @@ describe('ProductMapper', () => {
     expect(out.discount_percent).toBe(10);
     expect(out.image_url).toBe('/uploads/a.png');
   });
+
+  it('fills nulls when optional prisma fields are missing', () => {
+    const out = toLegacyProduct({
+      productId: 1,
+      name: 'Y',
+      price: 10,
+      stock: 1,
+      active: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    expect(out.description).toBeNull();
+    expect(out.tech_sheet).toBeNull();
+    expect(out.category).toBeNull();
+    expect(out.image_url).toBeNull();
+    expect(out.video_url).toBeNull();
+    expect(out.active).toBe(false);
+  });
 });

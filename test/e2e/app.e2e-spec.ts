@@ -19,21 +19,39 @@ function createInvoiceToken(orderId: number, ttlSeconds = 3600) {
 }
 
 class MockMpClientService {
+  lastExternalRef: string | null = null;
+  lastItems: any[] = [];
+
   preference() {
     return {
-      create: async () => ({
-        response: {
+      create: async ({ body }: any = {}) => {
+        this.lastExternalRef = body?.external_reference ? String(body.external_reference) : null;
+        this.lastItems = Array.isArray(body?.items) ? body.items : [];
+        return {
           id: 'pref_mock',
           init_point: 'https://mock.mercadopago/init',
           sandbox_init_point: 'https://mock.mercadopago/sandbox',
-        },
-      }),
+        };
+      },
     };
   }
 
   payment() {
+    const self = this;
     return {
-      get: async () => ({ response: { id: 'pay_mock', status: 'approved' } }),
+      get: async ({ id }: any) => {
+        const amount = self.lastItems.reduce(
+          (acc: number, it: any) => acc + Number(it.unit_price || 0) * Number(it.quantity || 1),
+          0,
+        );
+        return {
+          id,
+          status: 'approved',
+          transaction_amount: amount || 5000,
+          currency_id: 'COP',
+          external_reference: self.lastExternalRef,
+        };
+      },
     };
   }
 }
@@ -113,15 +131,27 @@ describe('E2E', () => {
   });
 
   it('payments/create returns init_point (MercadoPago mocked)', async () => {
+    const login = await request(app.getHttpServer())
+      .post('/api/login')
+      .send({ email: 'admin@tienda.com', password: 'Admin12345!' })
+      .expect(201);
+
+    const product = await request(app.getHttpServer())
+      .post('/api/products')
+      .set('Authorization', `Bearer ${login.body.token}`)
+      .send({ name: 'Item preferencia', price: 10000, stock: 5 })
+      .expect(201);
+
     const res = await request(app.getHttpServer())
       .post('/api/payments/create')
       .send({
-        items: [{ product_id: 999, title: 'Test item', unit_price: 10000, quantity: 1 }],
+        items: [{ product_id: product.body.product_id, title: 'Test item', unit_price: 1, quantity: 1 }],
       })
       .expect(201);
 
     expect(res.body.init_point).toBe('https://mock.mercadopago/init');
     expect(res.body.id).toBe('pref_mock');
+    expect(res.body.order_id).toBeTruthy();
   });
 
   it('ads + stats + reports + reviews controllers', async () => {
@@ -191,8 +221,7 @@ describe('E2E', () => {
 
     expect(Array.isArray(list.body)).toBe(true);
   });
-  it('full payment flow: create -> confirm(pending) -> webhook(approved) -> invoice', async () => {
-    // login admin
+  it('full payment flow: create PENDING -> confirm verifies MP API -> webhook idempotent -> invoice', async () => {
     const login = await request(app.getHttpServer())
       .post('/api/login')
       .send({ email: 'admin@tienda.com', password: 'Admin12345!' })
@@ -200,7 +229,6 @@ describe('E2E', () => {
 
     const token = login.body.token;
 
-    // create product to reference in order_items
     const product = await request(app.getHttpServer())
       .post('/api/products')
       .set('Authorization', `Bearer ${token}`)
@@ -209,39 +237,35 @@ describe('E2E', () => {
 
     const productId = product.body.product_id;
 
-    // 1) create preference
     const pref = await request(app.getHttpServer())
       .post('/api/payments/create')
       .send({
-        items: [{ product_id: productId, title: 'Producto Pago', unit_price: 5000, quantity: 1 }],
+        items: [{ product_id: productId, title: 'Producto Pago', unit_price: 1, quantity: 1 }],
       })
       .expect(201);
 
     expect(pref.body.init_point).toContain('mock.mercadopago');
+    expect(pref.body.order_id).toBeTruthy();
+    const orderId = pref.body.order_id;
 
-    // 2) confirm from front with PENDING status
     const confirm = await request(app.getHttpServer())
       .post('/api/payments/confirm')
       .send({
-        status: 'pending',
+        status: 'approved',
         payment_id: 'pay_mock_123',
-        payer_email: 'buyer@test.com',
-        domicilio_modo: 'recoger',
-        domicilio_costo: 0,
-        items: [{ product_id: productId, title: 'Producto Pago', unit_price: 5000, quantity: 1 }],
+        order_id: orderId,
       })
       .expect(201);
 
     expect(confirm.body.ok).toBe(true);
-    const orderId = confirm.body.order_id;
+    expect(confirm.body.order_id).toBe(orderId);
+    expect(String(confirm.body.status).toUpperCase()).toBe('APPROVED');
 
-    // 3) webhook from MercadoPago sets status APPROVED via mocked payment.get
     await request(app.getHttpServer())
       .post('/api/payments/webhook')
       .query({ topic: 'payment', id: 'pay_mock_123' })
-      .expect(201);
+      .expect(200);
 
-    // 4) verify order updated (requires auth)
     const detail = await request(app.getHttpServer())
       .get(`/api/orders/${orderId}`)
       .set('Authorization', `Bearer ${token}`)
@@ -251,7 +275,6 @@ describe('E2E', () => {
     expect(detail.body.order.payment_status).toBe('APPROVED');
     expect(detail.body.order.status).toBe('APPROVED');
 
-    // 5) fetch invoice JSON (public but token-protected)
     const invToken = createInvoiceToken(orderId);
     const invoice = await request(app.getHttpServer())
       .get(`/api/invoices/${orderId}`)

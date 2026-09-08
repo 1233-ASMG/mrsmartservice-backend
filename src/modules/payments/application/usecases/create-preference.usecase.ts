@@ -3,107 +3,136 @@ import type { Request } from 'express';
 import { PrismaService } from '../../../../common/prisma/prisma.service.js';
 import { MpClientService } from '../../infrastructure/mp-client.service.js';
 import { CreatePaymentDto } from '../../dto/create-payment.dto.js';
-import { buildBackUrls, envBool, MP_CURRENCY, normalizeItem } from '../utils/payments.utils.js';
+import {
+  buildBackUrls,
+  envBool,
+  MP_CURRENCY,
+  normalizeItem,
+  notificationUrl,
+  roundMoney,
+  villavicencioShippingPrice,
+} from '../utils/payments.utils.js';
 
+/**
+ * Crea la preferencia de Mercado Pago y deja la orden en PENDING.
+ * Los precios salen de la base de datos, no del carrito.
+ * El cobro se confirma después con webhook + Payment.get, no con back_url.
+ */
 @Injectable()
 export class CreatePreferenceUseCase {
-  constructor(private readonly prisma: PrismaService, private readonly mp: MpClientService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly mp: MpClientService,
+  ) {}
 
   async execute(dto: CreatePaymentDto, req: Request) {
     const itemsIn = Array.isArray(dto?.items) ? dto.items : [];
     if (!itemsIn.length) throw new BadRequestException({ error: 'missing_items' });
 
-    const roundPrice = (v: number) => {
-      // MercadoPago expects integer amounts for some currencies (e.g. COP).
-      if (MP_CURRENCY === 'COP') return Math.round(v);
-      return Math.round(v * 100) / 100;
-    };
+    const mpItems: any[] = [];
+    const dbItems: { productId: number | null; quantity: number; unitPrice: number; title: string }[] = [];
 
-    const normalized: any[] = [];
     for (const raw of itemsIn) {
       const n = normalizeItem(raw);
-      // Allow a special non-product line item for shipping.
-      // Frontend may send something like { type:'shipping', product_id:'SHIP', unit_price: 5000, quantity:1 }.
+
       if (n.isShipping) {
-        const shipPrice = roundPrice(Number(n.unit_price));
-        if (!Number.isFinite(shipPrice) || shipPrice <= 0) {
-          throw new BadRequestException({ error: 'bad_item' });
-        }
-        normalized.push({
+        const shipPrice = villavicencioShippingPrice();
+        mpItems.push({
           id: 'SHIP',
           title: n.title || 'Envío',
           unit_price: shipPrice,
           quantity: n.quantity,
           currency_id: MP_CURRENCY,
         });
+        dbItems.push({ productId: null, quantity: n.quantity, unitPrice: shipPrice, title: n.title || 'Envío' });
         continue;
       }
 
-      // If we have a numeric productId, we can enrich/validate data from DB.
-      if (Number.isFinite(n.productId) && (n.productId as number) > 0) {
-        const productId = n.productId as number;
-        let price = n.unit_price;
-        let title = n.title;
-
-        if (!Number.isFinite(price) || price <= 0 || !title) {
-          const p = await this.prisma.product.findUnique({
-            where: { productId },
-            select: { name: true, price: true, discountPercent: true, discountStart: true, discountEnd: true },
-          });
-          if (!p) throw new BadRequestException({ error: 'product_not_found', productId });
-
-          title = title || p.name || 'Producto';
-
-          if (!Number.isFinite(price) || price <= 0) {
-            price = Number(p.price);
-            const discount = Number(p.discountPercent || 0);
-            if (discount > 0) {
-              let active = true;
-              if (p.discountStart && p.discountEnd) {
-                const now = new Date();
-                const start = new Date(p.discountStart);
-                const end = new Date(p.discountEnd);
-                active = now >= start && now <= end;
-              }
-              if (active) price = Math.round(price * (1 - discount / 100));
-            }
-          }
-        }
-
-        price = roundPrice(Number(price));
-        if (!Number.isFinite(price) || price <= 0) throw new BadRequestException({ error: 'bad_item' });
-
-        normalized.push({
-          id: String(productId),
-          title,
-          unit_price: price,
-          quantity: n.quantity,
-          currency_id: MP_CURRENCY,
-        });
-        continue;
-      }
-
-      // Fallback: allow items without a productId (e.g. old localStorage carts)
-      // as long as title + unit_price are valid.
-      const fallbackPrice = roundPrice(Number(n.unit_price));
-      if (!n.title || !Number.isFinite(fallbackPrice) || fallbackPrice <= 0) {
+      if (!Number.isFinite(n.productId) || (n.productId as number) <= 0) {
         throw new BadRequestException({ error: 'bad_item' });
       }
 
-      normalized.push({
-        id: `CUSTOM:${String(n.title).slice(0, 32)}`,
-        title: n.title,
-        unit_price: fallbackPrice,
+      const productId = n.productId as number;
+      const p = await this.prisma.product.findUnique({
+        where: { productId },
+        select: { name: true, price: true, discountPercent: true, discountStart: true, discountEnd: true },
+      });
+      if (!p) throw new BadRequestException({ error: 'product_not_found', productId });
+
+      let price = Number(p.price);
+      const discount = Number(p.discountPercent || 0);
+      if (discount > 0) {
+        let active = true;
+        if (p.discountStart && p.discountEnd) {
+          const now = new Date();
+          active = now >= new Date(p.discountStart) && now <= new Date(p.discountEnd);
+        }
+        if (active) price = Math.round(price * (1 - discount / 100));
+      }
+      price = roundMoney(price);
+      if (!Number.isFinite(price) || price <= 0) throw new BadRequestException({ error: 'bad_item' });
+
+      const title = p.name || n.title || 'Producto';
+      mpItems.push({
+        id: String(productId),
+        title,
+        unit_price: price,
         quantity: n.quantity,
         currency_id: MP_CURRENCY,
       });
+      dbItems.push({ productId, quantity: n.quantity, unitPrice: price, title });
     }
 
+    const shipping = dto.shipping || {};
+    const domicilioCosto = dbItems
+      .filter((it) => it.productId == null)
+      .reduce((acc, it) => acc + it.unitPrice * it.quantity, 0);
+    const productsTotal = dbItems
+      .filter((it) => it.productId != null)
+      .reduce((acc, it) => acc + it.unitPrice * it.quantity, 0);
+    const finalTotal = roundMoney(productsTotal + domicilioCosto);
+
+    const created = await this.prisma.$transaction(async (tx) => {
+      const o = await tx.order.create({
+        data: {
+          buyerName: shipping.nombre ?? null,
+          buyerPhone: shipping.telefono ?? null,
+          totalAmount: String(finalTotal) as any,
+          status: 'PENDING',
+          paymentStatus: 'PENDING',
+          domicilioModo: shipping.mode ?? null,
+          domicilioNombre: shipping.nombre ?? null,
+          domicilioDireccion: shipping.direccion ?? null,
+          domicilioBarrio: shipping.barrio ?? null,
+          domicilioCiudad: shipping.ciudad ?? null,
+          domicilioTelefono: shipping.telefono ?? null,
+          domicilioNota: shipping.nota ?? null,
+          domicilioCosto: String(domicilioCosto) as any,
+        },
+        select: { orderId: true },
+      });
+
+      await tx.orderItem.createMany({
+        data: dbItems
+          .filter((it) => it.productId != null)
+          .map((it) => ({
+            orderId: o.orderId,
+            productId: it.productId,
+            quantity: it.quantity,
+            unitPrice: String(it.unitPrice) as any,
+            totalPrice: String(it.unitPrice * it.quantity) as any,
+          })),
+      });
+
+      return o;
+    });
+
     const back_urls = buildBackUrls('/postpago');
-    // MercadoPago exige back_urls.success definida cuando se usa auto_return (error "back_url.success must be defined")
     const pref = this.mp.preference();
     const body: any = {
-      items: normalized,
+      items: mpItems,
+      external_reference: String(created.orderId),
+      notification_url: notificationUrl(req),
       back_urls: {
         success: back_urls.success,
         failure: back_urls.failure,
@@ -117,10 +146,19 @@ export class CreatePreferenceUseCase {
     const data: any = (out as any) ?? {};
     const response = data.response ?? data;
 
+    await this.prisma.order.update({
+      where: { orderId: created.orderId },
+      data: {
+        mpPreferenceId: response.id ? String(response.id) : null,
+        mpInitPoint: response.init_point ? String(response.init_point) : null,
+      },
+    });
+
     return {
       init_point: response.init_point,
       sandbox_init_point: response.sandbox_init_point,
       id: response.id,
+      order_id: created.orderId,
       back_urls,
     };
   }

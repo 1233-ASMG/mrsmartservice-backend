@@ -53,6 +53,28 @@ export function buildBackUrls(path = '/postpago') {
   };
 }
 
+export function roundMoney(v: number) {
+  if (MP_CURRENCY === 'COP') return Math.round(v);
+  return Math.round(v * 100) / 100;
+}
+
+/** Precio de envío a Villavicencio: lo define el servidor, no el carrito. */
+export function villavicencioShippingPrice() {
+  const n = Number(process.env.SHIPPING_VILLAVICENCIO_COP || 7000);
+  return roundMoney(Number.isFinite(n) && n > 0 ? n : 7000);
+}
+
+export function amountsMatch(expected: number, paid: number) {
+  if (MP_CURRENCY === 'COP') return Math.round(expected) === Math.round(paid);
+  return Math.abs(Number(expected) - Number(paid)) < 0.01;
+}
+
+export function notificationUrl(req: Request) {
+  const env = String(process.env.PUBLIC_API_URL || '').trim().replace(/\/+$/, '');
+  const base = env || baseUrlFromReq(req).replace(/\/+$/, '');
+  return `${base}/api/payments/webhook`;
+}
+
 export function normalizeItem(i: any) {
   const rawId = i?.product_id ?? i?.productId ?? i?.id;
   const rawIdStr = rawId === undefined || rawId === null ? '' : String(rawId).trim();

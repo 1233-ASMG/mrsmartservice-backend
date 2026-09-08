@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpException, HttpStatus, Post, Req, UseGuards } from '@nestjs/common';
+import type { Request } from 'express';
 import { LoginDto } from './dto/login.dto.js';
 import { RequestResetDto } from './dto/request-reset.dto.js';
 import { ResetPasswordDto } from './dto/reset-password.dto.js';
@@ -11,6 +12,30 @@ import { GetMeUseCase } from './application/usecases/get-me.usecase.js';
 import { RequestPasswordResetUseCase } from './application/usecases/request-password-reset.usecase.js';
 import { ResetPasswordUseCase } from './application/usecases/reset-password.usecase.js';
 import { ChangePasswordUseCase } from './application/usecases/change-password.usecase.js';
+import { allowAttempt, clientKey } from '../../common/rate-limit.js';
+
+@Controller()
+export class AuthController {
+  constructor(
+    private readonly loginUC: LoginUseCase,
+    private readonly meUC: GetMeUseCase,
+    private readonly requestResetUC: RequestPasswordResetUseCase,
+    private readonly resetPasswordUC: ResetPasswordUseCase,
+    private readonly changePasswordUC: ChangePasswordUseCase,
+  ) {}
+
+  @Post('api/login')
+  login(@Body() dto: LoginDto, @Req() req: Request) {
+    const ip = clientKey(req);
+    if (!allowAttempt(`login:${ip}`, 20, 15 * 60 * 1000)) {
+      throw new HttpException({ error: 'too_many_attempts' }, HttpStatus.TOO_MANY_REQUESTS);
+    }
+    const email = String(dto.email || '').trim().toLowerCase();
+    if (email && !allowAttempt(`login-email:${email}`, 10, 15 * 60 * 1000)) {
+      throw new HttpException({ error: 'too_many_attempts' }, HttpStatus.TOO_MANY_REQUESTS);
+    }
+    return this.loginUC.execute(dto.email, dto.password);
+  }
 
 @Controller()
 export class AuthController {

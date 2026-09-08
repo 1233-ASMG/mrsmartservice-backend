@@ -1,3 +1,7 @@
+/**
+ * Legado: no está cableado en AuthModule.
+ * El login del panel vive en application/usecases/login.usecase.ts
+ */
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';

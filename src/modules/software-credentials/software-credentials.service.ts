@@ -105,8 +105,10 @@ export class SoftwareCredentialsService {
     const buyerEmail = (order.buyerEmail ?? '').toLowerCase();
     const payerEmail = (order.payerEmail ?? '').toLowerCase();
     if (email !== buyerEmail && email !== payerEmail) {
-      // No revelamos si existe o no
       throw new BadRequestException({ error: 'order_email_mismatch' });
+    }
+    if (String(order.status || '').toUpperCase() !== 'APPROVED') {
+      throw new BadRequestException({ error: 'order_not_paid' });
     }
 
     const creds = await (this.prisma as any).softwareCredential.findMany({
@@ -150,12 +152,15 @@ export class SoftwareCredentialsService {
 
     const order = await this.prisma.order.findUnique({
       where: { orderId },
-      select: { orderId: true, buyerEmail: true, payerEmail: true },
+      select: { orderId: true, buyerEmail: true, payerEmail: true, status: true },
     });
     if (!order) throw new BadRequestException({ error: 'order_not_found' });
     const buyerEmail = (order.buyerEmail ?? '').toLowerCase();
     const payerEmail = (order.payerEmail ?? '').toLowerCase();
     if (email !== buyerEmail && email !== payerEmail) throw new BadRequestException({ error: 'order_email_mismatch' });
+    if (String(order.status || '').toUpperCase() !== 'APPROVED') {
+      throw new BadRequestException({ error: 'order_not_paid' });
+    }
 
     const cred = await (this.prisma as any).softwareCredential.findUnique({
       where: { credentialId },

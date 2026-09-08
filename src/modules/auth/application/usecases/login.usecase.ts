@@ -15,18 +15,11 @@ export class LoginUseCase {
 
     const user = await this.repo.findByEmail(normalizedEmail);
     if (!user) {
-      console.warn('[Login] invalid_credentials: user_not_found', { email: normalizedEmail });
       return { error: 'invalid_credentials' };
     }
 
     const ok = await bcrypt.compare(trimmedPassword, user.passwordHash);
     if (!ok) {
-      const hashIsBcrypt = user.passwordHash.startsWith('$2');
-      console.warn('[Login] invalid_credentials: password_mismatch', {
-        email: normalizedEmail,
-        userId: user.userId,
-        hashIsBcrypt,
-      });
       return { error: 'invalid_credentials' };
     }
 
